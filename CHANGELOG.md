@@ -8,6 +8,20 @@ All notable changes to this project are documented in this file.
 
 ### Added
 
+- **eSCL walkup ("Scan to Computer") for devices without `DiscoveryTree.xml`**:
+  printers whose firmware only implements the standard eSCL endpoints can now
+  run in `listen` mode. The app registers a walkup subscription on
+  `/eSCL/WalkupSubscriptions` (HTTP or the device's self-signed HTTPS
+  endpoint), long-polls the printer panel events, and maps the selected
+  shortcut to a scan job. This covers the HP OfficeJet Pro 8120e / 8122e
+  series. Auto-detected when the device does not serve `DiscoveryTree.xml`;
+  `--prefer-eSCL` remains available to force eSCL on dual-protocol devices.
+  When the eSCL endpoint is HTTPS-only, its self-signed certificate is
+  accepted by default with a warning; set `ESCL_CERT_FINGERPRINT` to the
+  certificate's SHA-256 fingerprint to pin and verify it.
+  Walkup support is probed before `listen` selects this protocol, so devices
+  that only implement eSCL scanning keep working with `single-scan` and
+  `adf-autoscan` instead of being mistaken for walkup devices.
 - **Nix flake** (`flake.nix` + `packaging/nix/package.nix`): installs the
   self-contained Linux binary shipped with each release (x86_64/aarch64) and
   provides a default configuration under
@@ -30,6 +44,53 @@ All notable changes to this project are documented in this file.
   universal `.dmg` on both Intel and Apple Silicon Macs. Its version and DMG
   checksum are refreshed automatically on master after each stable release
   (same mechanism as the Nix flake hashes).
+- **Post-processing commands**: `--post-command-pdf` and
+  `--post-command-image` (or `post_command_pdf` / `post_command_image` in the
+  config file) run external commands over the generated PDFs and the image
+  pages respectively, before they are uploaded or cleaned up, e.g. to produce
+  PDF/A archives, sign documents, inject metadata or watermark images, without
+  bundling or maintaining any of those tools in the project. Each command only
+  receives the file type it was configured for. It is given as a program and
+  its arguments (the config keys also accept an explicit argument list) and
+  supports `{input}` (the file path) and `{output}` (a temp file that replaces
+  the file on success); without `{output}` the command is expected to modify
+  the file in place. It runs without a shell, so file names are never
+  interpreted as shell syntax, and it is stopped if it runs for too long (the
+  timeout is configurable with `--post-command-timeout` /
+  `post_command_timeout`, with `POST_COMMAND_TIMEOUT` as the fallback default;
+  a value a timer cannot honour is refused rather than silently cut to 1 ms).
+  Commands that fail never block the flow: the original file is kept and the
+  error is logged, and a command leaving an empty file or a symbolic link in
+  place of the scan counts as a failure. In the container the commands are set
+  with the `POST_COMMAND_PDF` / `POST_COMMAND_IMAGE` environment variables
+  (`POST_COMMAND_TIMEOUT` for the fallback timeout). Files a command writes
+  beside the scan are treated as part of it — recognized by taking their name
+  from the scan file, any other file appearing beside the scan is left
+  untouched: S3 and Nextcloud receive them next to the scan, Paperless does
+  not (an upload there would become a standalone document), and they are
+  removed with the scan only once they were actually delivered.
+- **Webhook notifications**: every completed scan POSTs a JSON event
+  (`scan-completed`, or `scan-delivery-failed` when a delivery target failed)
+  to a configurable URL, carrying the scan metadata, per-page descriptors, the
+  outcome of each delivery target and one descriptor per delivered file
+  (name, size, SHA-256 and where to fetch it: local path, S3 `bucket`/`key` or
+  Nextcloud WebDAV URL) — including the sidecars a post-command writes beside
+  the scan and the PDFs the paperless stage generates. Events are signed with HMAC-SHA256 (custom header supported) or
+  authenticated with bearer/basic auth, sent with an `idempotency-key` header;
+  delivery is best-effort (a single POST, failures are logged). A webhook is
+  a notification, not a delivery target: configured alone it never removes the
+  scan, retention stays governed by the delivery targets and `keep_files`.
+  Each `delivery` entry also carries the identifiers the target returned —
+  Paperless task ids, Nextcloud WebDAV URLs, S3 `bucket`/`key` — so a consumer
+  can still find the document when no local file is left.
+  Two payload profiles: `full` (default, with the scanner IP, the printer
+  destination label and the local file paths) and `minimal` (none of those and
+  no raw delivery error text, so the event can go to a receiver outside the
+  local network), selected with `--webhook-payload` / `webhook_payload` /
+  `WEBHOOK_PAYLOAD`.
+  Configured with the new `--webhook-*` CLI options, the matching `webhook_*`
+  config file keys or the `WEBHOOK_*` environment variables (Docker). The
+  event contract is described in `protocol_doc/webhook/openapi.yaml`.
 
 ### Changed
 
@@ -43,6 +104,12 @@ All notable changes to this project are documented in this file.
   thus rejected on Windows but still fine on POSIX systems. The documented
   pattern example (`--pattern` help, README) was updated to the `: `-free
   `"scan"_dd.mm.yyyy_HHMMss` form, which works everywhere.
+- **Default configuration**: the tracked `config/default.json` no longer
+  carries a hardcoded device address, so the shipped default works for any
+  device instead of pointing at one network. Personal settings belong in
+  `config/local.json`, which the `config` package merges over the default and
+  git now ignores, or in a directory of your own via `NODE_CONFIG_DIR`; the
+  README documents both.
 
 ### Security
 
@@ -50,9 +117,36 @@ All notable changes to this project are documented in this file.
   no longer serialize request `config`/`headers`, so SigV4 signatures,
   STS session tokens, Nextcloud basic-auth passwords and Paperless tokens
   cannot appear in logs.
+- **Post-processing commands**: the configured program is now validated to
+  reject shell metacharacters, and the hook is spawned with `shell` explicitly
+  disabled, so a configured command can never be re-parsed as shell syntax.
+- **Release workflow downloads**: the nfpm tarball (deb/rpm/apk packaging),
+  the WinSW service wrapper bundled into the Windows installer and the
+  `wingetcreate` tool used to open the winget PR are now checked against
+  pinned SHA-512/SHA-256 hashes before use, so a tampered download fails the
+  build. nfpm was also bumped to 2.48.0, and wingetcreate now comes from a
+  versioned URL instead of the floating `aka.ms/wingetcreate/latest` alias.
+- **Workflow checkout credentials**: every `actions/checkout` step now sets
+  `persist-credentials` explicitly (`false` except for the release job that
+  pushes the Nix/Homebrew bump), so the workflow `GITHUB_TOKEN` is not left
+  in the git configuration for later steps and third-party actions to read.
 
 ### Fixed
 
+- **Flatbed multi-page scans no longer crash when the printer drops the idle
+  connection**: `waitForScanEventFromTarget` (the wait between pages on the
+  platen) now finalizes the current scan instead of propagating the
+  `ECONNRESET`/`504` when the printer cuts the connection, and bounds the
+  wait using the printer-reported `UserActionTimeout` (issue #1802, builds
+  on #1543).
+- **Debian/RPM packages no longer ship the OpenRC init script**, which made
+  `systemctl enable` fail on systemd distributions: the entry in
+  `packaging/nfpm.yaml` is now restricted to the `apk` packager
+  (issue #1803).
+- **Documentation mentions port 8080**: the Linux networking notes and a
+  troubleshooting entry now state that scan job creation/page download use
+  TCP 8080 in addition to port 80, and `postJob()`/`downloadPage*()` use
+  timeouts so a filtered port fails with a clear error (issue #1804).
 - **Tests on Windows**: the suite now runs green again on Windows. The README
   help snapshot test compares line endings that git may convert to CRLF, the
   `~` home expansion produced mixed path separators, and the read-only folder
@@ -71,10 +165,11 @@ All notable changes to this project are documented in this file.
 - **eSCL devices without `DiscoveryTree.xml`** (`src/DeviceClient.ts`,
   `src/scanJobHandlers.ts`, `src/hpModels/EsclScanStatus.ts`,
   `src/readDeviceCapabilities.ts`): support scanners whose firmware omits
-  `/DevMgmt/DiscoveryTree.xml` and serve only the standard eSCL endpoints on
-  port 80. DiscoveryTree 404s/405s are tolerated, capabilities are probed at
-  `/eSCL/ScanCapabilities` and `/eSCL/ScannerCapabilities` when eSCL is
-  preferred, `/NextDocument` is fetched on port 80, and the eSCL job loop now
+  `/DevMgmt/DiscoveryTree.xml` and serve only the standard eSCL endpoints.
+  DiscoveryTree 404s/405s are tolerated, capabilities are probed at
+  `/eSCL/ScanCapabilities` and `/eSCL/ScannerCapabilities` when the tree
+  advertises no scan interface (or when eSCL is explicitly preferred),
+  `/NextDocument` is fetched on the device's eSCL base URL, and the eSCL job loop now
   ends on a terminal job state reason instead of `ImagesToTransfer == 0`
   (the latter can be 0 while a multi-page job is still scanning); a 404 from
   `/NextDocument` is treated as the end-of-job signal instead of aborting an

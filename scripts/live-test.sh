@@ -40,6 +40,21 @@ else
   bad "no jpeg produced"
 fi
 
+echo "--- single-scan --pdf with pdf post-command"
+mkdir -p "$WORK/pdf"
+PDFS=0
+if timeout 60 $BIN --address "$IP" single-scan -d "$WORK/pdf" --pdf \
+  --post-command-pdf 'cp "{input}" "{output}"' >"$WORK/pdf.log" 2>&1; then
+  PDFS="$(find "$WORK/pdf" -name '*.pdf' 2>/dev/null | wc -l)"
+  if [ "$PDFS" -ge 1 ]; then
+    ok "$PDFS pdf(s) produced and post-processed"
+  else
+    bad "no pdf produced by --pdf flow (see $WORK/pdf.log)"
+  fi
+else
+  bad "single-scan --pdf failed (see $WORK/pdf.log)"
+fi
+
 echo "--- discover"
 found=0
 for _ in 1 2 3; do
@@ -66,6 +81,16 @@ else
   bad "healthcheck did not respond"
 fi
 kill "$HPID" 2>/dev/null || true
+
+echo "--- listen --prefer-eSCL (brief: waits for the panel)"
+rc=0
+timeout 8 $BIN --address "$IP" listen --prefer-eSCL \
+  >"$WORK/listen-escl.log" 2>&1 || rc=$?
+if [ "$rc" -eq 0 ] || [ "$rc" -eq 124 ]; then
+  ok "listen --prefer-eSCL started and registered its target"
+else
+  bad "listen --prefer-eSCL failed to start (rc=$rc, see $WORK/listen-escl.log)"
+fi
 
 echo "--- adf-autoscan (brief: waits for the feeder)"
 mkdir -p "$WORK/adf"

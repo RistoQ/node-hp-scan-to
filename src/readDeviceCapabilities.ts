@@ -4,13 +4,11 @@ import type DiscoveryTree from "./type/DiscoveryTree.js";
 import type EsclScanCaps from "./hpModels/EsclScanCaps.js";
 import type { IScanStatus } from "./hpModels/IScanStatus.js";
 import type { DeviceCapabilities } from "./type/DeviceCapabilities.js";
-import type { InputSource } from "./type/InputSource.js";
-import type { IScanJobSettings } from "./hpModels/IScanJobSettings.js";
 import EsclScanJobSettings from "./hpModels/EsclScanJobSettings.js";
 import ScanJobSettings from "./hpModels/ScanJobSettings.js";
-import type { ScanMode } from "./type/scanMode.js";
-import type { ImageFormat } from "./imageFormats/index.js";
 import type { IScanCaps } from "./IScanCaps.js";
+import LegacyScanListener from "./scanListeners/LegacyScanListener.js";
+import EsclWalkupScanListener from "./scanListeners/EsclWalkupScanListener.js";
 import { getLoggerForFile } from "./logger.js";
 
 const logger = getLoggerForFile(import.meta.url);
@@ -38,10 +36,16 @@ async function getScanCaps(
     if (scanJobManifest.scanCapsURI !== null) {
       eSclScanCaps = await api.getEsclScanCaps(scanJobManifest.scanCapsURI);
     }
-  } else if (preferEscl) {
-    // No eSCL manifest advertised (or no DiscoveryTree at all): when eSCL
-    // is explicitly preferred, probe the standard eSCL capabilities
-    // endpoints directly.
+  } else if (preferEscl || !discoveryTree.hasScanInterface) {
+    // No eSCL manifest advertised (or no scan interface at all): probe the
+    // standard eSCL capabilities endpoints directly. This also covers
+    // devices that no longer serve DiscoveryTree.xml, without requiring an
+    // explicit --prefer-eSCL.
+    logger.info(
+      preferEscl
+        ? "Probing the well-known eSCL capabilities endpoints because eSCL is preferred."
+        : "The device advertises no scan interface; probing the well-known eSCL capabilities endpoints.",
+    );
     eSclScanCaps = await api.getEsclScanCapsFromWellKnownPath();
     if (eSclScanCaps !== null) {
       logger.info("eSCL capabilities discovered via well-known endpoint.");
@@ -58,18 +62,132 @@ async function getScanCaps(
   return eSclScanCaps;
 }
 
+async function resolveWalkupScanListener(
+  api: DeviceClient,
+  discoveryTree: DiscoveryTree,
+  scanCaps: IScanCaps | null,
+  preferEscl: boolean,
+  detectWalkup: boolean,
+  legacyScanToComp: boolean | null,
+  userActionTimeout: number | null,
+): Promise<DeviceCapabilities["createWalkupScanListener"]> {
+  if (!detectWalkup) {
+    return null;
+  }
+
+  if (legacyScanToComp !== null) {
+    const isScanToComp = legacyScanToComp;
+    logger.info(
+      `Using ${isScanToComp ? "WalkupScanToComp" : "WalkupScan"} walkup listener.`,
+    );
+    return (listenerApi, registrationConfigs) =>
+      new LegacyScanListener(
+        listenerApi,
+        registrationConfigs,
+        isScanToComp,
+        userActionTimeout,
+      );
+  }
+
+  if (
+    scanCaps?.isEscl === true &&
+    (preferEscl || !discoveryTree.hasScanInterface) &&
+    (await api.supportsEsclWalkup())
+  ) {
+    logger.info("Using eSCL walkup listener.");
+    return (listenerApi, registrationConfigs) =>
+      new EsclWalkupScanListener(listenerApi, registrationConfigs);
+  }
+
+  if (scanCaps?.isEscl === true) {
+    logger.info(
+      "The device supports eSCL scanning but not eSCL walkup; the listen command is not available for it.",
+    );
+    return null;
+  }
+
+  logger.warn(
+    "No compatible device capabilities detected. It appears that your device may not support the listen command. While the application will still run, there is a possibility it may crash. If your device includes an automatic document feeder, consider using the adf-autoscan command instead.",
+  );
+  return (listenerApi, registrationConfigs) =>
+    new LegacyScanListener(
+      listenerApi,
+      registrationConfigs,
+      false,
+      userActionTimeout,
+    );
+}
+
+function buildScanStatusReader(
+  api: DeviceClient,
+  scanCaps: IScanCaps | null,
+): () => Promise<IScanStatus> {
+  return scanCaps?.isEscl === true
+    ? async () => await api.getEsclScanStatus()
+    : async () => await api.getScanStatus();
+}
+
+function buildScanJobSettingsFactory(
+  scanCaps: IScanCaps | null,
+): DeviceCapabilities["createScanJobSettings"] {
+  return (
+    inputSource,
+    contentType,
+    format,
+    resolution,
+    mode,
+    width,
+    height,
+    isDuplex,
+    contextID,
+  ) =>
+    scanCaps?.isEscl === true
+      ? new EsclScanJobSettings(
+          inputSource,
+          contentType,
+          format,
+          resolution,
+          mode,
+          width,
+          height,
+          isDuplex,
+          contextID,
+        )
+      : new ScanJobSettings(
+          inputSource,
+          contentType,
+          format,
+          resolution,
+          mode,
+          width,
+          height,
+          isDuplex,
+          scanCaps as ScanCaps,
+        );
+}
+
+function buildScanJobSubmitter(
+  api: DeviceClient,
+  scanCaps: IScanCaps | null,
+): DeviceCapabilities["submitScanJob"] {
+  return scanCaps?.isEscl === true
+    ? async (scanJobSettings) => await api.postEsclJob(scanJobSettings)
+    : async (scanJobSettings) => await api.postJob(scanJobSettings);
+}
+
 export async function readDeviceCapabilities(
   api: DeviceClient,
   preferEscl: boolean,
+  detectWalkup = false,
 ): Promise<DeviceCapabilities> {
   let supportsMultiItemScanFromPlaten = true;
-  let useWalkupScanToComp: boolean | undefined;
+  let legacyScanToComp: boolean | null = null;
   let userActionTimeout: number | null = null;
 
   const discoveryTree = await api.getDiscoveryTree();
 
   if (discoveryTree.WalkupScanToCompManifestURI !== null) {
-    useWalkupScanToComp = true;
+    legacyScanToComp = true;
     const walkupScanToCompManifest = await api.getWalkupScanToCompManifest(
       discoveryTree.WalkupScanToCompManifestURI,
     );
@@ -82,10 +200,20 @@ export async function readDeviceCapabilities(
       userActionTimeout = walkupScanToCompCaps.userActionTimeout;
     }
   } else if (discoveryTree.WalkupScanManifestURI !== null) {
+    legacyScanToComp = false;
     await api.getWalkupScanManifest(discoveryTree.WalkupScanManifestURI);
-    useWalkupScanToComp = false;
   }
   const scanCaps = await getScanCaps(api, discoveryTree, preferEscl);
+
+  const createWalkupScanListener = await resolveWalkupScanListener(
+    api,
+    discoveryTree,
+    scanCaps,
+    preferEscl,
+    detectWalkup,
+    legacyScanToComp,
+    userActionTimeout,
+  );
 
   if (scanCaps === null) {
     logger.warn(
@@ -104,69 +232,13 @@ export async function readDeviceCapabilities(
     );
   }
 
-  const getScanStatus = async (): Promise<IScanStatus> => {
-    let scanStatus: IScanStatus;
-    if (scanCaps?.isEscl === true) {
-      scanStatus = await api.getEsclScanStatus();
-    } else {
-      scanStatus = await api.getScanStatus();
-    }
-    return scanStatus;
-  };
-
-  const createScanJobSettings = (
-    inputSource: InputSource,
-    contentType: "Document" | "Photo",
-    format: ImageFormat,
-    resolution: number,
-    mode: ScanMode,
-    width: number | null,
-    height: number | null,
-    isDuplex: boolean,
-  ): IScanJobSettings => {
-    let scanJobSettings: IScanJobSettings;
-    if (scanCaps?.isEscl === true) {
-      scanJobSettings = new EsclScanJobSettings(
-        inputSource,
-        contentType,
-        format,
-        resolution,
-        mode,
-        width,
-        height,
-        isDuplex,
-      );
-    } else {
-      scanJobSettings = new ScanJobSettings(
-        inputSource,
-        contentType,
-        format,
-        resolution,
-        mode,
-        width,
-        height,
-        isDuplex,
-        scanCaps as ScanCaps,
-      );
-    }
-    return scanJobSettings;
-  };
-
-  const submitScanJob = async (
-    scanJobSettings: IScanJobSettings,
-  ): Promise<string> => {
-    let jobUrl: string;
-    if (scanCaps?.isEscl === true) {
-      jobUrl = await api.postEsclJob(scanJobSettings);
-    } else {
-      jobUrl = await api.postJob(scanJobSettings);
-    }
-    return jobUrl;
-  };
+  const getScanStatus = buildScanStatusReader(api, scanCaps);
+  const createScanJobSettings = buildScanJobSettingsFactory(scanCaps);
+  const submitScanJob = buildScanJobSubmitter(api, scanCaps);
 
   return {
     supportsMultiItemScanFromPlaten,
-    useWalkupScanToComp,
+    createWalkupScanListener,
     platenMaxWidth: scanCaps?.platenMaxWidth ?? null,
     platenMaxHeight: scanCaps?.platenMaxHeight ?? null,
     adfMaxWidth: scanCaps?.adfMaxWidth ?? null,
